@@ -11,16 +11,25 @@ import (
 	"github.com/zesty-co/terraform-provider-zesty/internal/models"
 )
 
+const (
+	defaultRetryAttempts  = 4
+	defaultRetryBaseDelay = 2 * time.Second
+)
+
 type Client struct {
-	HostURL    string
-	HTTPClient *http.Client
-	Token      string
+	HostURL        string
+	HTTPClient     *http.Client
+	Token          string
+	RetryAttempts  int
+	RetryBaseDelay time.Duration
 }
 
 func NewClient(host *string, token string) (*Client, error) {
 	c := Client{
-		HTTPClient: &http.Client{Timeout: 180 * time.Second},
-		HostURL:    models.DefaultHostURL,
+		HTTPClient:     &http.Client{Timeout: 180 * time.Second},
+		HostURL:        models.DefaultHostURL,
+		RetryAttempts:  defaultRetryAttempts,
+		RetryBaseDelay: defaultRetryBaseDelay,
 	}
 
 	if host != nil {
@@ -39,16 +48,63 @@ func (c *Client) Validate() error {
 		return err
 	}
 
-	_, err = c.DoRequest(req)
+	_, err = c.DoRequestWithRetry(req)
 	return err
 }
 
 func (c *Client) DoRequest(req *http.Request) ([]byte, error) {
+	body, _, err := c.do(req)
+	return body, err
+}
+
+// DoRequestWithRetry sends a request, retrying transport errors and transient
+// upstream statuses (429/502/503/504) with exponential backoff. The onboarding
+// API sits behind an API gateway whose integration can intermittently time out,
+// so reads during Terraform refresh must tolerate one-off gateway failures.
+// Only use it for requests that are safe to repeat.
+func (c *Client) DoRequestWithRetry(req *http.Request) ([]byte, error) {
+	attempts := c.RetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(c.RetryBaseDelay << (attempt - 1))
+		}
+
+		body, status, err := c.do(req.Clone(req.Context()))
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+
+		if status != 0 && !retryableStatus(status) {
+			return nil, err
+		}
+	}
+
+	return nil, lastErr
+}
+
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+func (c *Client) do(req *http.Request) ([]byte, int, error) {
 	req.Header.Set("x-api-key", c.Token)
 
 	res, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer func() {
 		_ = res.Body.Close()
@@ -56,14 +112,14 @@ func (c *Client) DoRequest(req *http.Request) ([]byte, error) {
 
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, res.StatusCode, err
 	}
 
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("status: %d, body: %s", res.StatusCode, body)
+		return nil, res.StatusCode, fmt.Errorf("status: %d, body: %s", res.StatusCode, body)
 	}
 
-	return body, err
+	return body, res.StatusCode, nil
 }
 
 func (c *Client) CreateAccount(payload models.Payload) (*models.Account, error) {
@@ -115,7 +171,7 @@ func (c *Client) GetAccounts() (*[]models.Account, error) {
 		return nil, err
 	}
 
-	body, err := c.DoRequest(req)
+	body, err := c.DoRequestWithRetry(req)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +192,7 @@ func (c *Client) GetAccount(accountID string) (*models.Account, error) {
 		return nil, err
 	}
 
-	body, err := c.DoRequest(req)
+	body, err := c.DoRequestWithRetry(req)
 	if err != nil {
 		return nil, err
 	}

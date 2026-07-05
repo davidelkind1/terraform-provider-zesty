@@ -462,6 +462,101 @@ func TestClient_GetAccount(t *testing.T) {
 	}
 }
 
+func TestClient_GetAccount_RetriesTransientErrors(t *testing.T) {
+	sampleAccount := &models.Account{AccountID: "acc123", CloudProvider: models.AWS}
+	sampleAccountBytes, _ := json.Marshal(sampleAccount)
+
+	t.Run("recovers after gateway timeouts", func(t *testing.T) {
+		var calls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			if calls <= 2 {
+				w.WriteHeader(http.StatusGatewayTimeout)
+				_, _ = w.Write([]byte(`{"message": "Network error communicating with endpoint"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(sampleAccountBytes)
+		}))
+		defer server.Close()
+
+		c, _ := client.NewClient(&server.URL, "retry-token")
+		c.RetryBaseDelay = time.Millisecond
+
+		account, err := c.GetAccount("acc123")
+		assert.NoError(t, err)
+		assert.Equal(t, sampleAccount, account)
+		assert.Equal(t, 3, calls)
+	})
+
+	t.Run("gives up after configured attempts", func(t *testing.T) {
+		var calls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusGatewayTimeout)
+			_, _ = w.Write([]byte("gateway timeout"))
+		}))
+		defer server.Close()
+
+		c, _ := client.NewClient(&server.URL, "retry-token")
+		c.RetryBaseDelay = time.Millisecond
+
+		account, err := c.GetAccount("acc123")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "status: 504")
+		assert.Nil(t, account)
+		assert.Equal(t, 4, calls)
+	})
+
+	t.Run("does not retry non-transient statuses", func(t *testing.T) {
+		var calls int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("not found"))
+		}))
+		defer server.Close()
+
+		c, _ := client.NewClient(&server.URL, "retry-token")
+		c.RetryBaseDelay = time.Millisecond
+
+		account, err := c.GetAccount("acc123")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "status: 404")
+		assert.Nil(t, account)
+		assert.Equal(t, 1, calls)
+	})
+
+	t.Run("retries connection errors", func(t *testing.T) {
+		nonExistentURL := "http://localhost:12345"
+		c, _ := client.NewClient(&nonExistentURL, "retry-token")
+		c.HTTPClient = &http.Client{Timeout: 100 * time.Millisecond}
+		c.RetryBaseDelay = time.Millisecond
+
+		account, err := c.GetAccount("acc123")
+		assert.Error(t, err)
+		assert.Nil(t, account)
+	})
+}
+
+func TestClient_CreateAccount_DoesNotRetry(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte("gateway timeout"))
+	}))
+	defer server.Close()
+
+	c, _ := client.NewClient(&server.URL, "create-token")
+	c.RetryBaseDelay = time.Millisecond
+
+	account, err := c.CreateAccount(models.Payload{AccountID: "acc123"})
+	assert.Error(t, err)
+	assert.Nil(t, account)
+	assert.Equal(t, 1, calls)
+}
+
 func TestClient_UpdateAccount(t *testing.T) {
 	type testCase struct {
 		name             string
